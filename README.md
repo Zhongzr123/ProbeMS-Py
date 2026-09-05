@@ -1,2 +1,1 @@
-# ProbeMS-Py
-MS2 Spectrum Batch Search Tool
+A Python tool that scans mzML files for two specified reporter ions in MS2 spectra, clusters hits by precursor m/z (10 ppm), and exports CSV results per file plus a global summary. Designed for analyzing paired isotopic probe reactions.
