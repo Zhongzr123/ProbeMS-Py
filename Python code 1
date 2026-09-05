@@ -1,393 +1,370 @@
 import xml.etree.ElementTree as ET
-import os
-import csv
+import os, csv, re
 import numpy as np
-import base64
-import zlib
-import re
+import base64, zlib
 from pathlib import Path
+from collections import defaultdict
 
 
-class MzMLSearcher:
-    def __init__(self, mzml_file_path):
-        self.mzml_file_path = mzml_file_path
-        self.tree = None
+class MzMLParser:
+    def __init__(self, f):
+        self.f = f
         self.root = None
-        self.mzml_root = None
-        self.namespace = {}
+        self.mzml = None
+        self.ns = {}
 
-    def parse_mzml(self):
+    def load(self):
         try:
-            self.tree = ET.parse(self.mzml_file_path)
-            self.root = self.tree.getroot()
-            root_tag = self.root.tag
-            if '}' in root_tag:
-                self.namespace = {'mzml': root_tag.split('}')[0] + '}'}
+            tree = ET.parse(self.f)
+            self.root = tree.getroot()
+            tag = self.root.tag
+            if '}' in tag:
+                self.ns = {'mzml': tag.split('}')[0] + '}'}
             else:
-                self.namespace = {}
-            if 'indexedmzML' in root_tag:
-                self.mzml_root = self.root.find('.//{*}mzML')
+                self.ns = {}
+            if 'indexedmzML' in tag:
+                self.mzml = self.root.find('.//{*}mzML')
             else:
-                self.mzml_root = self.root
-            return self.mzml_root is not None
-        except Exception as e:
-            print(f"  Failed to parse {os.path.basename(self.mzml_file_path)}: {e}")
+                self.mzml = self.root
+            return self.mzml is not None
+        except:
             return False
 
-    def get_cv_param_value(self, element, accession):
-        for cv in element.findall('.//{*}cvParam'):
-            if cv.get('accession') == accession:
+    def _get_cv(self, el, acc):
+        for cv in el.findall('.//{*}cvParam'):
+            if cv.get('accession') == acc:
                 return cv.get('value')
         return None
 
-    def extract_scan_number(self, spectrum):
-        spectrum_id = spectrum.get('id', '')
-        match = re.search(r'scan=(\d+)', spectrum_id)
-        if match:
-            return int(match.group(1))
-        if spectrum_id.isdigit():
-            return int(spectrum_id)
-        return None
+    def _scan_num(self, spec):
+        sid = spec.get('id', '')
+        m = re.search(r'scan=(\d+)', sid)
+        if m:
+            return int(m.group(1))
+        return int(sid) if sid.isdigit() else None
 
-    def decode_binary_array(self, binary_array):
+    def _decode(self, arr):
         try:
-            data_type = None
-            compression = None
-            for cv in binary_array.findall('.//{*}cvParam'):
-                accession = cv.get('accession')
-                if accession == 'MS:1000523':
-                    data_type = 'float64'
-                elif accession == 'MS:1000521':
-                    data_type = 'float32'
-                elif accession == 'MS:1000574':
-                    compression = 'zlib'
-            binary_element = binary_array.find('.//{*}binary')
-            if binary_element is None or not binary_element.text:
+            dtype = None
+            comp = None
+            for cv in arr.findall('.//{*}cvParam'):
+                acc = cv.get('accession')
+                if acc == 'MS:1000523':
+                    dtype = 'float64'
+                elif acc == 'MS:1000521':
+                    dtype = 'float32'
+                elif acc == 'MS:1000574':
+                    comp = 'zlib'
+
+            be = arr.find('.//{*}binary')
+            if be is None or not be.text:
                 return None
-            compressed_data = base64.b64decode(binary_element.text)
-            if compression == 'zlib':
+
+            raw = base64.b64decode(be.text)
+            if comp == 'zlib':
                 try:
-                    decompressed_data = zlib.decompress(compressed_data)
-                except:
-                    decompressed_data = compressed_data
-            else:
-                decompressed_data = compressed_data
-            if data_type == 'float64':
-                try:
-                    return np.frombuffer(decompressed_data, dtype=np.float64)
+                    raw = zlib.decompress(raw)
                 except:
                     pass
-            if data_type == 'float32':
+
+            if dtype == 'float64':
                 try:
-                    return np.frombuffer(decompressed_data, dtype=np.float32)
+                    return np.frombuffer(raw, dtype=np.float64)
                 except:
                     pass
-            if len(decompressed_data) % 8 == 0:
+            if dtype == 'float32':
                 try:
-                    data = np.frombuffer(decompressed_data, dtype=np.float64)
-                    if len(data) > 0 and 0 < np.median(data) < 2000:
-                        return data
+                    return np.frombuffer(raw, dtype=np.float32)
                 except:
                     pass
-            if len(decompressed_data) % 4 == 0:
+            if len(raw) % 8 == 0:
                 try:
-                    data = np.frombuffer(decompressed_data, dtype=np.float32)
-                    if len(data) > 0 and 0 < np.median(data) < 2000:
-                        return data
+                    return np.frombuffer(raw, dtype=np.float64)
+                except:
+                    pass
+            if len(raw) % 4 == 0:
+                try:
+                    return np.frombuffer(raw, dtype=np.float32)
                 except:
                     pass
             return None
         except:
             return None
 
-    def find_precursor_by_mz(self, target_mz, tolerance_ppm=10):
-        matching_indices = []
-        spectra = self.mzml_root.findall('.//{*}spectrum')
-        for spectrum in spectra:
-            spectrum_index = spectrum.get('index')
-            if not spectrum_index:
-                continue
-            scan_number = self.extract_scan_number(spectrum)
-            ms_level = self.get_cv_param_value(spectrum, 'MS:1000511')
-            if ms_level != '2':
-                continue
-            selected_ion = spectrum.find('.//{*}selectedIon')
-            if selected_ion is None:
-                continue
-            precursor_mz = None
-            peak_intensity = None
-            for cv in selected_ion.findall('.//{*}cvParam'):
-                accession = cv.get('accession')
-                if accession == 'MS:1000744':
-                    precursor_mz = float(cv.get('value'))
-                elif accession == 'MS:1000042':
-                    peak_intensity = float(cv.get('value'))
-            if precursor_mz is None:
-                continue
-            ppm_error = abs(precursor_mz - target_mz) / target_mz * 1e6
-            if ppm_error <= tolerance_ppm and peak_intensity > 100000:
-                matching_indices.append({
-                    'index': int(spectrum_index),
-                    'scan': scan_number,
-                    'precursor_mz': precursor_mz,
-                    'precursor_intensity': peak_intensity,
-                    'ppm_error': ppm_error,
-                    'spectrum': spectrum
-                })
-        return matching_indices
-
-    def check_multiple_fragment_ions(self, spectrum, target_fragment_mz_A, target_fragment_mz_B, tolerance_ppm=10):
+    def find_reporter(self, spec, mzA, mzB, thresh=1e5, tol_ppm=10):
         try:
-            binary_data_list = spectrum.find('.//{*}binaryDataArrayList')
-            if binary_data_list is None:
-                return False, None, None, None, None, None
-            mz_array = None
-            intensity_array = None
-            for binary_array in binary_data_list.findall('.//{*}binaryDataArray'):
-                array_type = None
-                for cv in binary_array.findall('.//{*}cvParam'):
-                    accession = cv.get('accession')
-                    if accession == 'MS:1000514':
-                        array_type = 'mz'
-                    elif accession == 'MS:1000515':
-                        array_type = 'intensity'
-                if array_type:
-                    data = self.decode_binary_array(binary_array)
-                    if data is not None:
-                        if array_type == 'mz':
-                            mz_array = data
+            prec_mz = None
+            prec_int = None
+            si = spec.find('.//{*}selectedIon')
+            if si is not None:
+                for cv in si.findall('.//{*}cvParam'):
+                    acc = cv.get('accession')
+                    if acc == 'MS:1000744':
+                        prec_mz = float(cv.get('value'))
+                    elif acc == 'MS:1000042':
+                        prec_int = float(cv.get('value'))
+
+            blist = spec.find('.//{*}binaryDataArrayList')
+            if blist is None:
+                return False, prec_mz, prec_int, None, None, None, None, None, None
+
+            mz_arr = None
+            int_arr = None
+            for ba in blist.findall('.//{*}binaryDataArray'):
+                typ = None
+                for cv in ba.findall('.//{*}cvParam'):
+                    acc = cv.get('accession')
+                    if acc == 'MS:1000514':
+                        typ = 'mz'
+                    elif acc == 'MS:1000515':
+                        typ = 'intensity'
+                if typ:
+                    d = self._decode(ba)
+                    if d is not None:
+                        if typ == 'mz':
+                            mz_arr = d
                         else:
-                            intensity_array = data
-            if mz_array is None or intensity_array is None:
-                return False, None, None, None, None, None
-            min_len = min(len(mz_array), len(intensity_array))
-            mz_array = mz_array[:min_len]
-            intensity_array = intensity_array[:min_len]
-            best_match_A = None
-            best_ppm_error_A = float('inf')
-            best_intensity_A = 0
-            best_match_B = None
-            best_ppm_error_B = float('inf')
-            best_intensity_B = 0
-            for i in range(min_len):
-                mz = mz_array[i]
-                intensity = intensity_array[i]
-                if intensity > 100000:
-                    ppm_error_A = abs(mz - target_fragment_mz_A) / target_fragment_mz_A * 1e6
-                    if ppm_error_A <= tolerance_ppm and ppm_error_A < best_ppm_error_A:
-                        best_ppm_error_A = ppm_error_A
-                        best_match_A = mz
-                        best_intensity_A = intensity
-                    ppm_error_B = abs(mz - target_fragment_mz_B) / target_fragment_mz_B * 1e6
-                    if ppm_error_B <= tolerance_ppm and ppm_error_B < best_ppm_error_B:
-                        best_ppm_error_B = ppm_error_B
-                        best_match_B = mz
-                        best_intensity_B = intensity
-            if best_match_A is not None and best_match_B is not None:
-                return True, best_match_A, best_intensity_A, best_match_B, best_intensity_B, best_intensity_B / best_intensity_A
-            return False, None, None, None, None, None
+                            int_arr = d
+
+            if mz_arr is None or int_arr is None:
+                return False, prec_mz, prec_int, None, None, None, None, None, None
+
+            n = min(len(mz_arr), len(int_arr))
+            mz_arr = mz_arr[:n]
+            int_arr = int_arr[:n]
+
+            bestA_mz = bestB_mz = None
+            bestA_int = bestB_int = 0
+            errA = errB = float('inf')
+
+            for i in range(n):
+                m = mz_arr[i]
+                it = int_arr[i]
+                if it > thresh:
+                    ea = abs(m - mzA) / mzA * 1e6
+                    if ea <= tol_ppm and ea < errA:
+                        errA = ea
+                        bestA_mz = m
+                        bestA_int = it
+                    eb = abs(m - mzB) / mzB * 1e6
+                    if eb <= tol_ppm and eb < errB:
+                        errB = eb
+                        bestB_mz = m
+                        bestB_int = it
+
+            if bestA_mz is not None and bestB_mz is not None and bestA_int > thresh and bestB_int > thresh:
+                return True, prec_mz, prec_int, bestA_mz, bestA_int, bestB_mz, bestB_int, bestB_int/bestA_int, bestA_int/bestB_int
+            return False, prec_mz, prec_int, None, None, None, None, None, None
         except:
-            return False, None, None, None, None, None
+            return False, None, None, None, None, None, None, None, None
 
-    def search_spectra_with_multiple_fragments(self, precursor_matches, fragment_mz_A, fragment_mz_B, tolerance_ppm=10):
-        valid_indices = []
-        for match in precursor_matches:
-            spectrum = match.get('spectrum')
-            if spectrum is None:
-                spectra = self.mzml_root.findall('.//{*}spectrum')
-                for s in spectra:
-                    if s.get('index') == str(match['index']):
-                        spectrum = s
-                        break
-            if spectrum is None:
+    def scan(self, mzA, mzB, thresh=1e5, tol_ppm=10):
+        out = []
+        for spec in self.mzml.findall('.//{*}spectrum'):
+            idx = spec.get('index')
+            if idx is None:
                 continue
-            has_both, found_mz_A, intensity_A, found_mz_B, intensity_B, ratio = self.check_multiple_fragment_ions(
-                spectrum, fragment_mz_A, fragment_mz_B, tolerance_ppm
-            )
-            if has_both:
-                valid_indices.append({
-                    'index': match['index'],
-                    'scan': match['scan'],
-                    'precursor_mz': match['precursor_mz'],
-                    'precursor_intensity': match['precursor_intensity'],
-                    'fragment_mz_A': found_mz_A,
-                    'fragment_intensity_A': intensity_A,
-                    'fragment_mz_B': found_mz_B,
-                    'fragment_intensity_B': intensity_B,
-                    'intensity_ratio': ratio
+            if self._get_cv(spec, 'MS:1000511') != '2':
+                continue
+            scan = self._scan_num(spec)
+            ok, pm, pi, ma, ia, mb, ib, rBA, rAB = self.find_reporter(spec, mzA, mzB, thresh, tol_ppm)
+            if ok and pi is not None and pi > thresh:
+                out.append({
+                    'idx': int(idx),
+                    'scan': scan,
+                    'pmz': pm,
+                    'pint': pi,
+                    'mzA': ma,
+                    'intA': ia,
+                    'mzB': mb,
+                    'intB': ib,
+                    'rBA': rBA,
+                    'rAB': rAB
                 })
-        return valid_indices
+        return out
 
-    def save_results_to_csv(self, results, output_path, target_ratio=None):
+    def save(self, results, path):
         if not results:
             return False
         try:
-            with open(output_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['raw_scan_number', 'precursor_mz', 'precursor_intensity',
-                                 'fragment_mz_A', 'fragment_intensity_A',
-                                 'fragment_mz_B', 'fragment_intensity_B',
-                                 'intensity_ratio_B/A', 'delta_ratio (%)'])
-                for result in results:
-                    delta_ratio = (result['intensity_ratio'] - target_ratio) / target_ratio * 100 if target_ratio else 0
-                    writer.writerow([
-                        result['scan'],
-                        f"{result['precursor_mz']:.4f}",
-                        f"{result['precursor_intensity']:.2e}",
-                        f"{result['fragment_mz_A']:.4f}",
-                        f"{result['fragment_intensity_A']:.2e}",
-                        f"{result['fragment_mz_B']:.4f}",
-                        f"{result['fragment_intensity_B']:.2e}",
-                        f"{result['intensity_ratio']:.6f}",
-                        f"{delta_ratio:.4f}"
+            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                w = csv.writer(f)
+                w.writerow(['scan', 'precursor_mz', 'precursor_intensity',
+                            'reporter_mz_A', 'reporter_intensity_A',
+                            'reporter_mz_B', 'reporter_intensity_B',
+                            'ratio_B/A', 'ratio_A/B'])
+                for r in results:
+                    w.writerow([
+                        r['scan'],
+                        f"{r['pmz']:.4f}",
+                        f"{r['pint']:.2e}",
+                        f"{r['mzA']:.4f}",
+                        f"{r['intA']:.2e}",
+                        f"{r['mzB']:.4f}",
+                        f"{r['intB']:.2e}",
+                        f"{r['rBA']:.6f}",
+                        f"{r['rAB']:.6f}"
                     ])
             return True
-        except PermissionError:
-            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-            fallback_path = os.path.join(desktop, os.path.basename(output_path))
-            try:
-                with open(fallback_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                    writer = csv.writer(csvfile)
-                    writer.writerow(['raw_scan_number', 'precursor_mz', 'precursor_intensity',
-                                     'fragment_mz_A', 'fragment_intensity_A',
-                                     'fragment_mz_B', 'fragment_intensity_B',
-                                     'intensity_ratio_B/A', 'delta_ratio (%)'])
-                    for result in results:
-                        delta_ratio = (result['intensity_ratio'] - target_ratio) / target_ratio * 100 if target_ratio else 0
-                        writer.writerow([
-                            result['scan'],
-                            f"{result['precursor_mz']:.4f}",
-                            f"{result['precursor_intensity']:.2e}",
-                            f"{result['fragment_mz_A']:.4f}",
-                            f"{result['fragment_intensity_A']:.2e}",
-                            f"{result['fragment_mz_B']:.4f}",
-                            f"{result['fragment_intensity_B']:.2e}",
-                            f"{result['intensity_ratio']:.6f}",
-                            f"{delta_ratio:.4f}"
-                        ])
-                print(f"    Permission error, saved to desktop: {fallback_path}")
-                return True
-            except:
-                return False
         except:
             return False
 
 
-def extract_target_ratio_from_filename(filename):
-    pattern = r'(\d+)[_\-](\d+)'
-    matches = re.findall(pattern, filename)
-    if matches:
-        for match in reversed(matches):
-            try:
-                num1 = float(match[0])
-                num2 = float(match[1])
-                if num2 != 0:
-                    return round(num1 / num2, 2)
-            except:
-                continue
-    pattern2 = r'(\d+)/(\d+)'
-    matches2 = re.findall(pattern2, filename)
-    if matches2:
-        try:
-            num1 = float(matches2[0][0])
-            num2 = float(matches2[0][1])
-            if num2 != 0:
-                return round(num1 / num2, 2)
-        except:
-            pass
-    return 1.00
+def cluster_by_precursor(results, tol=10):
+    if not results:
+        return []
+    sorted_res = sorted(results, key=lambda x: x['pmz'])
+    clusters = []
+    cur = [sorted_res[0]]
+    for r in sorted_res[1:]:
+        centroid = np.mean([x['pmz'] for x in cur])
+        if abs(r['pmz'] - centroid) / centroid * 1e6 <= tol:
+            cur.append(r)
+        else:
+            clusters.append({
+                'centroid': np.mean([x['pmz'] for x in cur]),
+                'specs': cur,
+                'n': len(cur)
+            })
+            cur = [r]
+    if cur:
+        clusters.append({
+            'centroid': np.mean([x['pmz'] for x in cur]),
+            'specs': cur,
+            'n': len(cur)
+        })
+    return clusters
 
 
-def find_mzml_files(folder_path):
-    folder = Path(folder_path)
-    mzml_files = []
-    for pattern in ['*.mzML', '*.mzml']:
-        mzml_files.extend(folder.glob(pattern))
-    return [str(f) for f in mzml_files]
+def find_mzmls(folder):
+    p = Path(folder)
+    files = []
+    for ext in ['*.mzML', '*.mzml']:
+        files.extend(p.glob(ext))
+    return [str(f) for f in files]
+
+
+def save_clusters(clusters, path, mzA, mzB):
+    try:
+        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+            w = csv.writer(f)
+            w.writerow(['=' * 80])
+            w.writerow(['CLUSTERING SUMMARY'])
+            w.writerow([f'Reporter A: {mzA:.4f}, Reporter B: {mzB:.4f}'])
+            w.writerow(['=' * 80])
+            w.writerow([])
+
+            for ci, cl in enumerate(clusters, 1):
+                w.writerow([f'--- Cluster {ci} ---'])
+                w.writerow([f'Centroid: {cl["centroid"]:.4f}, n={cl["n"]}'])
+                w.writerow([])
+                w.writerow(['Scan', 'Prec_mz', 'Prec_int', 'A_mz', 'A_int', 'B_mz', 'B_int', 'B/A', 'A/B'])
+                for s in cl['specs']:
+                    w.writerow([
+                        s['scan'],
+                        f"{s['pmz']:.4f}",
+                        f"{s['pint']:.2e}",
+                        f"{s['mzA']:.4f}",
+                        f"{s['intA']:.2e}",
+                        f"{s['mzB']:.4f}",
+                        f"{s['intB']:.2e}",
+                        f"{s['rBA']:.6f}",
+                        f"{s['rAB']:.6f}"
+                    ])
+                w.writerow([])
+                w.writerow(['-' * 80])
+                w.writerow([])
+
+            w.writerow([])
+            w.writerow(['SUMMARY'])
+            w.writerow(['Cluster', 'Centroid_mz', 'Count'])
+            for ci, cl in enumerate(clusters, 1):
+                w.writerow([ci, f"{cl['centroid']:.4f}", cl['n']])
+        return True
+    except:
+        return False
 
 
 def main():
-    print("=" * 60)
-    print("Mass Spectrometry MS2 Spectrum Search - Batch Processing Mode")
-    print("=" * 60)
+    print('=' * 60)
+    print('MS2 Reporter Ion Search (Clustering Mode)')
+    print('=' * 60)
 
     while True:
-        folder_path = input("Enter the mass spectrometry folder path: ").strip()
-        if os.path.exists(folder_path) and os.path.isdir(folder_path):
+        folder = input('\nFolder path: ').strip()
+        if os.path.exists(folder) and os.path.isdir(folder):
             break
-        print(f"Folder not found: {folder_path}")
+        print(f'Folder not found: {folder}')
 
-    mzml_files = find_mzml_files(folder_path)
-    if not mzml_files:
-        print(f"Error: No .mzML files found in '{folder_path}'")
+    files = find_mzmls(folder)
+    if not files:
+        print(f'No .mzML files in {folder}')
         return
 
-    print(f"\nFound {len(mzml_files)} mzML file(s):")
-    for f in mzml_files:
-        print(f"  - {os.path.basename(f)}")
+    print(f'\nFound {len(files)} file(s):')
+    for f in files:
+        print(f'  - {os.path.basename(f)}')
 
-    print("\nTarget ratios (B/A) extracted from filenames:")
-    for f in mzml_files:
-        filename = os.path.basename(f)
-        ratio = extract_target_ratio_from_filename(filename)
-        print(f"  {filename}: {ratio:.2f}")
+    mzA = round(float(input('\nReporter A m/z (e.g., 126): ').strip()), 4)
+    mzB = round(float(input('Reporter B m/z (e.g., 127): ').strip()), 4)
 
-    precursor_mz = float(input("\nEnter precursor m/z: ").strip())
-    fragment_mz_A = float(input("Enter fragment m/z A: ").strip())
-    fragment_mz_B = float(input("Enter fragment m/z B: ").strip())
+    print(f'\nSearching for: A={mzA:.4f}, B={mzB:.4f} (10ppm, 1e5 threshold)')
+    print('-' * 60)
 
-    print(f"\nSearch criteria:")
-    print(f"  Precursor: {precursor_mz:.4f} (tolerance ±10ppm, intensity > 100000)")
-    print(f"  Fragment A: {fragment_mz_A:.4f} (tolerance ±10ppm, intensity > 100000)")
-    print(f"  Fragment B: {fragment_mz_B:.4f} (tolerance ±10ppm, intensity > 100000)")
-    print("-" * 60)
+    out_dir = os.path.join(folder, 'reporter_clusters')
+    os.makedirs(out_dir, exist_ok=True)
+    print(f'\nOutput: {out_dir}')
 
-    output_folder = os.path.join(folder_path, "searched_results")
-    os.makedirs(output_folder, exist_ok=True)
-    print(f"\nOutput folder: {output_folder}")
+    all_res = []
 
-    for mzml_file in mzml_files:
-        filename = os.path.basename(mzml_file)
-        target_ratio = extract_target_ratio_from_filename(filename)
+    for f in files:
+        name = os.path.basename(f)
+        print(f'\n{"=" * 60}')
+        print(f'Processing: {name}')
+        print('=' * 60)
 
-        print(f"\n{'=' * 60}")
-        print(f"Processing: {filename}")
-        print(f"Target ratio (B/A): {target_ratio:.2f}")
-        print(f"{'=' * 60}")
-
-        searcher = MzMLSearcher(mzml_file)
-        if not searcher.parse_mzml():
-            print(f"  Failed to parse file, skipping")
+        parser = MzMLParser(f)
+        if not parser.load():
+            print('  Parse failed, skipping')
             continue
 
-        print("\nStep 1: Precursor filtering...")
-        precursor_matches = searcher.find_precursor_by_mz(precursor_mz, tolerance_ppm=10)
-        if not precursor_matches:
-            print("  No MS2 spectra found matching precursor")
+        print('  Searching MS2 spectra...')
+        res = parser.scan(mzA, mzB, thresh=1e5, tol_ppm=10)
+
+        if not res:
+            print('  No hits')
             continue
 
-        print("\nStep 2: Fragment ions A and B filtering...")
-        valid_results = searcher.search_spectra_with_multiple_fragments(
-            precursor_matches, fragment_mz_A, fragment_mz_B, tolerance_ppm=10
-        )
-        if not valid_results:
-            print("  No MS2 spectra found containing both ions A and B")
-            continue
+        print(f'  Found {len(res)} spectra')
 
-        print(f"\nFound {len(valid_results)} spectra containing both ions A and B")
-        for i, result in enumerate(valid_results[:5], 1):
-            delta_ratio = (result['intensity_ratio'] - target_ratio) / target_ratio * 100
-            print(f"  {i}. Scan: {result['scan']}, Ratio: {result['intensity_ratio']:.6f}, Delta: {delta_ratio:.4f}%")
+        print('  Clustering by precursor m/z...')
+        clusters = cluster_by_precursor(res, tol=10)
+        print(f'  {len(clusters)} cluster(s):')
+        for i, c in enumerate(clusters, 1):
+            print(f'    {i}: n={c["n"]}, centroid={c["centroid"]:.4f}')
 
-        base_name = os.path.splitext(filename)[0]
-        output_file = os.path.join(output_folder, f"{base_name}_searched_results.csv")
-        if searcher.save_results_to_csv(valid_results, output_file, target_ratio):
-            print(f"\nResults saved to: {output_file}")
+        base = os.path.splitext(name)[0]
+        out_path = os.path.join(out_dir, f'{base}_clusters.csv')
+        save_clusters(clusters, out_path, mzA, mzB)
+        print(f'  Saved: {out_path}')
 
-    print("\n" + "=" * 60)
-    print("Batch processing complete!")
-    print("=" * 60)
+        all_res.extend(res)
+
+    if all_res:
+        print(f'\n{"=" * 60}')
+        print(f'Overall: {len(all_res)} spectra across all files')
+        overall = cluster_by_precursor(all_res, tol=10)
+        print(f'{len(overall)} overall clusters')
+        for i, c in enumerate(overall, 1):
+            print(f'  {i}: n={c["n"]}, centroid={c["centroid"]:.4f}')
+        overall_path = os.path.join(out_dir, 'ALL_clusters.csv')
+        save_clusters(overall, overall_path, mzA, mzB)
+        print(f'\nOverall saved: {overall_path}')
+
+    print('\n' + '=' * 60)
+    print('Done.')
+    print('=' * 60)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
